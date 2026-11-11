@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=Z_Mnemonics_Disabler
+X-Python-2-Compatible=false
+Name=Z Mnemonics Disabler
+Comment=Single toggle for global Qt Alt mnemonic suppression in Krita
