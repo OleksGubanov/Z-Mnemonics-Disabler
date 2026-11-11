@@ -468,3 +468,261 @@ def test_dynamic_label_and_rich_text():
     plain = QLabel("&Select", window)
     rich = QLabel("<a href='https://example.org?a=1&amp;b=2'>&Link</a>", window)
     app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    assert plain.text() == "Select"
+    assert rich.text().startswith("<a href=")
+    plain.setText("&Refresh")
+    assert guard._needs_update(plain)
+    guard._queue_widget(plain)
+    QTimer.flush()
+    assert plain.text() == "Refresh"
+    guard.set_enabled(False)
+    assert plain.text() == "&Refresh"
+    assert rich.text().endswith("</a>")
+
+
+def test_external_text_changes_are_not_undone():
+    _, guard_module = modules()
+    window = QWidget()
+    label = QLabel("&Original", window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    label.setText("Different label")
+    guard.set_enabled(False)
+    assert label.text() == "Different label"
+
+
+def test_mnemonics_reenable():
+    _, guard_module = modules()
+    window = QWidget()
+    label = QAbstractButton("&Apply", window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    for _ in range(3):
+        guard.set_enabled(True)
+        assert label.text() == "Apply"
+        guard.set_enabled(False)
+        assert label.text() == "&Apply"
+
+
+def test_updated_mnemonic_restores_last_real_label():
+    _, guard_module = modules()
+    window = QWidget()
+    label = QLabel("&Old", window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    label.setText("&New")
+    guard._scan_widget(label)
+    assert label.text() == "New"
+    guard.set_enabled(False)
+    assert label.text() == "&New"
+
+
+def test_qt_event_filter_fixes_text_before_paint():
+    _, guard_module = modules()
+    window = QWidget()
+    label = QLabel("&Start", window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    label.setText("&Finish")
+    event = types.SimpleNamespace(type=lambda: QEvent.Paint)
+    assert guard.eventFilter(label, event) is False
+    assert label.text() == "Finish"  # Already clean for this paint.
+    assert not QTimer.jobs  # No asynchronous repaint/flicker window.
+
+
+def test_repeated_paint_has_no_flicker_or_unnecessary_writes():
+    _, guard_module = modules()
+    window = QWidget()
+    button = QAbstractButton("&Create", window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    event = types.SimpleNamespace(type=lambda: QEvent.Paint)
+    initial_writes = button.write_count
+    for _ in range(100):
+        guard.eventFilter(button, event)
+        assert button.text() == "Create"
+    assert button.write_count == initial_writes
+    for n in range(30):
+        button.setText("&Create" if n % 2 else "&Cancel")
+        guard.eventFilter(button, event)
+        assert button.text() in ("Create", "Cancel")
+        assert "&" not in button.text()
+        assert not QTimer.jobs
+    guard.set_enabled(False)
+    assert button.text() == ("&Create" if (29 % 2) else "&Cancel")
+
+
+@pytest.mark.parametrize("kind,initial,updated", [
+    ("tab", ["&Dimensions", "&Content"], ["&General", "&Advanced"]),
+    ("toolbox", ["&Image", "&Color"], ["&Size", "&Depth"]),
+])
+def test_tab_and_toolbox_paint_changes_without_flicker(kind, initial, updated):
+    _, guard_module = modules()
+    window = QWidget()
+    control = QTabBar(initial, window) if kind == "tab" else QToolBox(initial, window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    current = control.tabs if kind == "tab" else control.items
+    assert current == [text.replace("&", "") for text in initial]
+    for n, text in enumerate(updated):
+        if kind == "tab":
+            control.setTabText(n, text)
+        else:
+            control.setItemText(n, text)
+    event = types.SimpleNamespace(type=lambda: QEvent.Paint)
+    guard.eventFilter(control, event)
+    assert current == [text.replace("&", "") for text in updated]
+    count = control.write_count
+    for _ in range(80):
+        guard.eventFilter(control, event)
+    assert control.write_count == count
+    assert not QTimer.jobs
+    guard.set_enabled(False)
+    assert current == updated
+
+
+def test_group_and_dock_title_changes_on_paint():
+    _, guard_module = modules()
+    window = QWidget()
+    group = QGroupBox("&Color", window)
+    dock = QDockWidget("&Layers", window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    assert group.title() == "Color"
+    assert dock.windowTitle() == "Layers"
+    group.setTitle("&Model")
+    dock.setWindowTitle("&Brush Presets")
+    event = types.SimpleNamespace(type=lambda: QEvent.Paint)
+    guard.eventFilter(group, event)
+    guard.eventFilter(dock, event)
+    assert group.title() == "Model"
+    assert dock.windowTitle() == "Brush Presets"
+    guard.set_enabled(False)
+    assert group.title() == "&Model"
+    assert dock.windowTitle() == "&Brush Presets"
+
+
+def test_rich_text_untouched_during_paint():
+    _, guard_module = modules()
+    window = QWidget()
+    label = QLabel('<a href="https://example.com?a=1&amp;b=2">&Link</a>', window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    event = types.SimpleNamespace(type=lambda: QEvent.Paint)
+    for _ in range(50):
+        guard.eventFilter(label, event)
+    assert label.text() == '<a href="https://example.com?a=1&amp;b=2">&Link</a>'
+    assert label.write_count == 0
+    guard.set_enabled(False)
+
+
+def test_mnemonic_conversion_is_stable_on_many_text_patterns():
+    from itertools import product
+    policy, _ = modules()
+    for length in range(6):
+        for parts in product("&Aa 5.", repeat=length):
+            value = "".join(parts)
+            converted = policy.strip_mnemonics(value)
+            assert policy.strip_mnemonics(converted) == converted, value
+
+
+def test_before_paint_path_handles_dynamic_dialog_controls():
+    _, guard_module = modules()
+    window = QDialog()
+    tabs = QTabBar(["&Dimensions", "&Content"], window)
+    group = QGroupBox("Image &Size", window)
+    label = QLabel("&Width:", window)
+    button = QAbstractButton("&Create", window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    event = types.SimpleNamespace(type=lambda: QEvent.Paint)
+    for ctrl in (tabs, group, label, button):
+        guard.eventFilter(ctrl, event)
+    assert tabs.tabs == ["Dimensions", "Content"]
+    assert group.title() == "Image Size"
+    assert label.text() == "Width:"
+    assert button.text() == "Create"
+    # A Qt translation or delayed control update puts the mnemonics back.
+    tabs.setTabText(1, "&Content")
+    group.setTitle("Image &Size")
+    label.setText("&Width:")
+    button.setText("&Create")
+    # The filter must fix every label before Qt draws the changed text.
+    for ctrl in (tabs, group, label, button):
+        guard.eventFilter(ctrl, event)
+    assert tabs.tabs == ["Dimensions", "Content"]
+    assert group.title() == "Image Size"
+    assert label.text() == "Width:"
+    assert button.text() == "Create"
+    assert not QTimer.jobs
+    guard.set_enabled(False)
+    assert tabs.tabs == ["&Dimensions", "&Content"]
+    assert group.title() == "Image &Size"
+    assert label.text() == "&Width:"
+    assert button.text() == "&Create"
+
+
+@pytest.mark.parametrize("kind", ["tab", "toolbox"])
+@pytest.mark.parametrize("removed_index", [0, 1, 2])
+def test_removing_indexed_item_restores_its_remaining_neighbors(kind, removed_index):
+    _, guard_module = modules()
+    window = QWidget()
+    original = ["&First", "Se&cond", "T&hird"]
+    control = QTabBar(original, window) if kind == "tab" else QToolBox(original, window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    if kind == "tab":
+        control.removeTab(removed_index)
+    else:
+        control.removeItem(removed_index)
+    guard.set_enabled(False)  # No paint event or scan between edit and restore.
+    restored = control.tabs if kind == "tab" else control.items
+    assert restored == [v for i, v in enumerate(original) if i != removed_index]
+
+
+@pytest.mark.parametrize("kind", ["tab", "toolbox"])
+@pytest.mark.parametrize("insert_index", [0, 1, 2])
+def test_inserting_new_item_keeps_originals_with_existing_items(kind, insert_index):
+    _, guard_module = modules()
+    window = QWidget()
+    control = (QTabBar(["&First", "Se&cond"], window)
+               if kind == "tab" else QToolBox(["&First", "Se&cond"], window))
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    if kind == "tab":
+        control.insertTab(insert_index, "&Added")
+    else:
+        control.insertItem(insert_index, QWidget(control), "&Added")
+    guard._scan_widget(control)
+    displayed = control.tabs if kind == "tab" else control.items
+    assert displayed == [x.replace("&", "") for x in
+                         (["&First", "Se&cond"][:insert_index]
+                          + ["&Added"]
+                          + ["&First", "Se&cond"][insert_index:])]
+    guard.set_enabled(False)
+    assert displayed == (["&First", "Se&cond"][:insert_index]
+                         + ["&Added"] + ["&First", "Se&cond"][insert_index:])
+
+
+@pytest.mark.parametrize("kind", ["tab", "toolbox"])
+def test_moving_indexed_items_does_not_mix_original_mnemonic_positions(kind):
+    _, guard_module = modules()
+    window = QWidget()
+    original = ["&Open", "O&pen", "&Close"]
+    control = QTabBar(original, window) if kind == "tab" else QToolBox(original, window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    if kind == "tab":
