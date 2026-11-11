@@ -726,3 +726,267 @@ def test_moving_indexed_items_does_not_mix_original_mnemonic_positions(kind):
     guard = guard_module.GlobalMnemonicGuard({}, app)
     guard.set_enabled(True)
     if kind == "tab":
+        control.moveTab(0, 1)  # QTabBar emits tabMoved.
+    else:
+        control.moveItem(0, 1)  # QToolBox is tracked by page QWidget.
+    guard.set_enabled(False)
+    displayed = control.tabs if kind == "tab" else control.items
+    assert displayed == ["O&pen", "&Open", "&Close"]
+
+
+def test_ambiguous_removed_tab_does_not_restore_wrong_original():
+    _, guard_module = modules()
+    window = QWidget()
+    tabs = QTabBar(["&Open", "O&pen"], window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    tabs.removeTab(0)
+    guard.set_enabled(False)
+    # Both original labels were "Open" while enabled. Without an ID after
+    # removal, restoring either mnemonic would be an unsupported guess.
+    assert tabs.tabs == ["Open"]
+
+
+def test_widget_destroy_clears_tracking_and_pending_state():
+    _, guard_module = modules()
+    window = QWidget()
+    tabs = QTabBar(["&First"], window)
+    toolbox = QToolBox(["&Second"], window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    guard._queue_widget(tabs)
+    for obj in (tabs, toolbox):
+        token = id(obj)
+        assert token in guard._tracked
+        obj.destroyed.emit(obj)
+        assert token not in guard._tracked
+        assert token not in guard._records
+        assert not any(key[0] == token for key in guard._indexed_counts)
+        assert not any(key[0] == token for key in guard._item_ids)
+    QTimer.flush()
+    guard.shutdown()
+    assert not app.filters
+    assert not guard._indexed_counts
+
+
+def test_many_paints_have_bounded_records_and_zero_extra_writes():
+    _, guard_module = modules()
+    window = QWidget()
+    tabs = QTabBar(["&Dimensions", "&Content", "&Settings"], window)
+    toolbox = QToolBox(["&A", "&B"], window)
+    button = QAbstractButton("&Create", window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    event = types.SimpleNamespace(type=lambda: QEvent.Paint)
+    writes_before = (tabs.write_count, toolbox.write_count, button.write_count)
+    tracked_before = guard.tracked_labels
+    for _ in range(10000):
+        for widget in (tabs, toolbox, button):
+            guard.eventFilter(widget, event)
+    assert (tabs.write_count, toolbox.write_count, button.write_count) == writes_before
+    assert guard.tracked_labels == tracked_before
+    assert not guard._pending_widgets
+    assert not QTimer.jobs
+    guard.shutdown()
+    assert not app.filters
+    assert not guard._records
+
+
+def extension_module(monkeypatch):
+    """Load main.py using a minimal Krita Extension mock."""
+    krita = types.ModuleType("krita")
+    class Extension:
+        def __init__(self, parent):
+            self.parent = parent
+    krita.Extension = Extension
+    monkeypatch.setitem(sys.modules, "krita", krita)
+    return importlib.import_module("Z_Mnemonics_Disabler.main")
+
+
+class KritaWindow:
+    def __init__(self, main):
+        self.main = main
+
+    def qwindow(self):
+        return self.main
+
+
+def test_extension_two_windows_toggle_and_app_shutdown(monkeypatch):
+    window_a = QMainWindow()
+    window_b = QMainWindow()
+    app = QApplication([window_a, window_b])
+    main = extension_module(monkeypatch)
+    extension = main.ZMnemonicsExtension(None)
+    extension.setup()
+    QTimer.flush()
+    assert extension.guard.enabled
+    extension.createActions(KritaWindow(window_a))
+    extension.createActions(KritaWindow(window_b))
+    QTimer.flush()
+    toggle_a = window_a._tools.actions()[0]
+    toggle_b = window_b._tools.actions()[0]
+    assert toggle_a.isChecked() and toggle_b.isChecked()
+    assert toggle_a.objectName() == toggle_b.objectName() == "zmd_toggle"
+    toggle_a.trigger()
+    assert not toggle_a.isChecked() and not toggle_b.isChecked()
+    assert not extension.guard.enabled
+    assert not main.load_enabled()
+    toggle_b.trigger()
+    assert toggle_a.isChecked() and toggle_b.isChecked()
+    assert extension.guard.enabled
+    assert main.load_enabled()
+    extension.createActions(KritaWindow(window_a))
+    QTimer.flush()
+    assert len(window_a._tools.actions()) == 1
+    assert len(app.filters) == 1
+    app.aboutToQuit.emit()
+    assert extension._closing
+    assert not app.filters
+    assert not extension.guard._tracked
+    assert not extension.guard._records
+    assert not extension._hosts
+
+
+def test_extension_toggle_rolls_back_on_failed_config_save(monkeypatch):
+    window = QMainWindow()
+    app = QApplication([window])
+    main = extension_module(monkeypatch)
+    ext = main.ZMnemonicsExtension(None)
+    ext.setup()
+    QTimer.flush()
+    ext.createActions(KritaWindow(window))
+    QTimer.flush()
+    toggle = window._tools.actions()[0]
+    assert toggle.isChecked()
+    monkeypatch.setattr(main, "save_enabled", lambda _enabled: False)
+    toggle.trigger()
+    assert toggle.isChecked()
+    assert ext.enabled
+    assert ext.guard.enabled
+    assert len(QMessageBox.warnings) == 1
+    ext.shutdown()
+
+
+def test_extension_queued_window_actions_cannot_run_after_shutdown(monkeypatch):
+    window = QMainWindow()
+    QApplication([window])
+    main = extension_module(monkeypatch)
+    ext = main.ZMnemonicsExtension(None)
+    ext.setup()
+    ext.createActions(KritaWindow(window))
+    existing = list(window._tools.actions())  # createActions mounts immediately.
+    ext.shutdown()
+    QTimer.flush()
+    QTimer.flush()
+    assert not ext._hosts
+    assert ext.guard is None  # Deferred initialization must not start.
+    assert window._tools.actions() == existing  # Timers did not add actions.
+
+@pytest.mark.parametrize("kind", ["tab", "toolbox"])
+def test_randomized_dynamic_controls_restore_without_changing_other_labels(kind):
+    """Short random UI histories: add, delete, move and rename pages."""
+    import random
+    _, guard_module = modules()
+    rng = random.Random(20261111)
+    for trial in range(100):
+        window = QWidget()
+        expected = ["&One", "T&wo", "Thr&ee"]
+        control = QTabBar(expected, window) if kind == "tab" else QToolBox(expected, window)
+        app = QApplication([window])
+        guard = guard_module.GlobalMnemonicGuard({}, app)
+        guard.set_enabled(True)
+        next_label = 0
+        for _ in range(10):
+            action = rng.choice(["insert", "remove", "move", "rename"])
+            if action == "insert":
+                index = rng.randint(0, len(expected))
+                text = f"&Entry{trial}_{next_label}"
+                next_label += 1
+                expected.insert(index, text)
+                if kind == "tab":
+                    control.insertTab(index, text)
+                else:
+                    control.insertItem(index, QWidget(control), text)
+            elif action == "remove" and expected:
+                index = rng.randrange(len(expected))
+                expected.pop(index)
+                if kind == "tab":
+                    control.removeTab(index)
+                else:
+                    control.removeItem(index)
+            elif action == "move" and len(expected) > 1:
+                old, new = rng.sample(range(len(expected)), 2)
+                expected.insert(new, expected.pop(old))
+                if kind == "tab":
+                    control.moveTab(old, new)
+                else:
+                    control.moveItem(old, new)
+            elif action == "rename" and expected:
+                index = rng.randrange(len(expected))
+                text = f"R&ename{trial}_{next_label}"
+                next_label += 1
+                expected[index] = text
+                if kind == "tab":
+                    control.setTabText(index, text)
+                else:
+                    control.setItemText(index, text)
+            guard._scan_widget(control)
+            displayed = control.tabs if kind == "tab" else control.items
+            assert displayed == [v.replace("&", "") for v in expected]
+        guard.set_enabled(False)
+        assert displayed == expected
+
+
+def test_extension_rolls_back_guard_and_preference_after_qt_exception(monkeypatch):
+    window = QMainWindow()
+    QApplication([window])
+    main = extension_module(monkeypatch)
+    extension = main.ZMnemonicsExtension(None)
+    extension.setup()
+    QTimer.flush()
+    extension.createActions(KritaWindow(window))
+    toggle = window._tools.actions()[0]
+    original_set_enabled = extension.guard.set_enabled
+    raised = False
+
+    def partially_failing_set_enabled(value):
+        nonlocal raised
+        original_set_enabled(value)
+        if not raised:
+            raised = True
+            raise RuntimeError("Synthetic Qt exception after switching")
+
+    monkeypatch.setattr(extension.guard, "set_enabled", partially_failing_set_enabled)
+    toggle.trigger()
+    assert raised
+    assert toggle.isChecked() is True
+    assert extension.enabled is True
+    assert extension.guard.enabled is True
+    assert main.load_enabled() is True
+    assert len(QMessageBox.warnings) == 1
+    extension.shutdown()
+
+
+def test_unmodified_tabs_and_toolboxes_are_not_tracked_or_rescanned_on_paint():
+    _, guard_module = modules()
+    window = QWidget()
+    tabs = QTabBar(["Dimensions", "Content"], window)
+    pages = QToolBox(["Basic", "Advanced"], window)
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    event = types.SimpleNamespace(type=lambda: QEvent.Paint)
+    for _ in range(2000):
+        assert guard._needs_update(tabs) is False
+        assert guard._needs_update(pages) is False
+        guard.eventFilter(tabs, event)
+        guard.eventFilter(pages, event)
+    assert id(tabs) not in guard._tracked
+    assert id(pages) not in guard._tracked
+    assert (id(tabs), "tab") not in guard._indexed_counts
+    assert (id(pages), "toolbox") not in guard._indexed_counts
+    assert tabs.write_count == pages.write_count == 0
+    guard.shutdown()
