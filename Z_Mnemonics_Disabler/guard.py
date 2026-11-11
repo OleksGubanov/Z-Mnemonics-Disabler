@@ -598,3 +598,20 @@ class GlobalMnemonicGuard(QObject):
             self._item_ids.clear()
         finally:
             self._busy = False
+
+    def shutdown(self):
+        # Krita is closing: do not touch widgets during Qt teardown.
+        self.enabled = False
+        if self._installed:
+            try:
+                self.app.removeEventFilter(self)
+            except (ReferenceError, RuntimeError):
+                pass
+        self._installed = False
+        self._records.clear()
+        self._tracked.clear()
+        self._menu_roles.clear()
+        self._pending_widgets.clear()
+        self._scanned_windows.clear()
+        self._indexed_counts.clear()
+        self._item_ids.clear()
