@@ -226,3 +226,245 @@ class QTabBar(QWidget):
 
     def removeTab(self, index):
         self.tabs.pop(index)
+
+    def insertTab(self, index, text):
+        self.tabs.insert(index, text)
+
+    def moveTab(self, old, new):
+        self.tabs.insert(new, self.tabs.pop(old))
+        self.tabMoved.emit(old, new)
+
+    def tabText(self, index):
+        return self.tabs[index]
+
+    def setTabText(self, index, text):
+        self.write_count += 1
+        self.tabs[index] = text
+
+
+class QToolBar(QWidget):
+    def actions(self):
+        return getattr(self, "_actions", [])
+
+
+class QToolBox(QWidget):
+    def __init__(self, items=None, parent=None):
+        super().__init__(parent)
+        self.items = list(items or [])
+        self.pages = [QWidget(self) for _ in self.items]
+        self.write_count = 0
+
+    def count(self):
+        return len(self.items)
+
+    def widget(self, index):
+        return self.pages[index]
+
+    def removeItem(self, index):
+        self.items.pop(index)
+        self.pages.pop(index)
+
+    def insertItem(self, index, page, text):
+        self.items.insert(index, text)
+        self.pages.insert(index, page)
+
+    def moveItem(self, old, new):
+        self.items.insert(new, self.items.pop(old))
+        self.pages.insert(new, self.pages.pop(old))
+
+    def itemText(self, index):
+        return self.items[index]
+
+    def setItemText(self, index, text):
+        self.write_count += 1
+        self.items[index] = text
+
+
+class QApplication(QObject):
+    current = None
+
+    def __init__(self, windows=None):
+        super().__init__()
+        self.windows = windows or []
+        self.filters = []
+        self.aboutToQuit = Signal()
+        QApplication.current = self
+
+    @staticmethod
+    def instance():
+        return QApplication.current
+
+    def topLevelWidgets(self):
+        return self.windows
+
+    def installEventFilter(self, obj):
+        self.filters.append(obj)
+
+    def removeEventFilter(self, obj):
+        self.filters.remove(obj)
+
+
+class QMessageBox:
+    warnings = []
+
+    @classmethod
+    def warning(cls, _parent, title, message):
+        cls.warnings.append((title, message))
+
+
+class QTimer:
+    jobs = []
+
+    @classmethod
+    def singleShot(cls, _delay, fn):
+        cls.jobs.append(fn)
+
+    @classmethod
+    def flush(cls):
+        jobs, cls.jobs = cls.jobs, []
+        for fn in jobs:
+            fn()
+
+
+class QEvent:
+    ActionAdded = 1
+    ActionChanged = 2
+    Show = 3
+    ChildAdded = 4
+    LanguageChange = 5
+    Polish = 6
+    PolishRequest = 7
+    Paint = 8
+
+
+class QStandardPaths:
+    AppConfigLocation = 1
+    location = ""
+
+    @staticmethod
+    def writableLocation(_type):
+        return QStandardPaths.location
+
+
+@pytest.fixture(autouse=True)
+def fake_modules(monkeypatch, tmp_path):
+    """Supply the small part of Qt used by the plugin."""
+    QStandardPaths.location = str(tmp_path / "krita-config")
+    QApplication.current = None
+    QTimer.jobs = []
+    QMessageBox.warnings = []
+    pyqt = types.ModuleType("PyQt5")
+    core = types.ModuleType("PyQt5.QtCore")
+    widgets = types.ModuleType("PyQt5.QtWidgets")
+    sip = types.ModuleType("PyQt5.sip")
+    core.QObject = QObject
+    core.QEvent = QEvent
+    core.QTimer = QTimer
+    core.QStandardPaths = QStandardPaths
+    core.Qt = types.SimpleNamespace(RichText=1, AutoText=0)
+    for klass in (
+        QApplication, QWidget, QDialog, QMenu, QMenuBar, QAbstractButton,
+        QLabel, QGroupBox, QTabBar, QToolBox, QDockWidget, QToolBar,
+        QMainWindow, QMessageBox,
+    ):
+        setattr(widgets, klass.__name__, klass)
+    sip.isdeleted = lambda _obj: False
+    pyqt.sip = sip
+    for name, module in (
+        ("PyQt5", pyqt), ("PyQt5.QtCore", core),
+        ("PyQt5.QtWidgets", widgets), ("PyQt5.sip", sip),
+    ):
+        monkeypatch.setitem(sys.modules, name, module)
+
+    # Import policy and guard without executing __init__.py (needs Krita).
+    pkg = types.ModuleType("Z_Mnemonics_Disabler")
+    pkg.__path__ = [str(ROOT / "Z_Mnemonics_Disabler")]
+    monkeypatch.setitem(sys.modules, "Z_Mnemonics_Disabler", pkg)
+    for name in ("policy", "guard", "main"):
+        sys.modules.pop("Z_Mnemonics_Disabler." + name, None)
+    yield
+
+
+def modules():
+    policy = importlib.import_module("Z_Mnemonics_Disabler.policy")
+    guard = importlib.import_module("Z_Mnemonics_Disabler.guard")
+    return policy, guard
+
+
+@pytest.mark.parametrize("source,expected", [
+    ("&File", "File"),
+    ("E&dit", "Edit"),
+    ("Save &As...", "Save As..."),
+    ("A && B", "A && B"),
+    ("AT&T", "AT&&T"),
+    ("A & B", "A && B"),
+    ("R&D", "R&&D"),
+    ("&Open && Close", "Open && Close"),
+    ("A &amp; B", "A &amp; B"),
+    ("<b>&Open</b>", "<b>&Open</b>"),
+    ("Nothing to change", "Nothing to change"),
+])
+def test_text_policy(source, expected):
+    policy, _ = modules()
+    assert policy.strip_mnemonics(source) == expected
+
+
+def test_config_upgrade_and_persistence(monkeypatch, tmp_path):
+    policy, _ = modules()
+    legacy = tmp_path / "old_config.json"
+    legacy.write_text('{"enabled": false}', encoding="utf-8")
+    monkeypatch.setattr(policy, "LEGACY_CONFIG", legacy)
+    assert policy.load_enabled() is False
+    assert policy.save_enabled(True)
+    assert policy.config_path().parent.is_dir()
+    assert policy.load_enabled() is True
+    assert legacy.read_text(encoding="utf-8") == '{"enabled": false}'
+
+
+def test_menu_and_action_restore_exact_originals():
+    _, guard_module = modules()
+    window = QWidget()
+    bar = QMenuBar(window)
+    menu = QMenu("&File", bar)
+    # QAction text may differ from the QMenu title.
+    menu.menuAction().setText("&Files")
+    bar.add(menu.menuAction())
+    menu.add(QAction("&Open"))
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    assert menu.title() == "File"
+    assert menu.menuAction().text() == "Files"
+    # Submenu entries are processed when that menu first opens.
+    guard._visit_menu(menu, "top")
+    assert menu.actions()[0].text() == "Open"
+    guard.set_enabled(False)
+    assert menu.title() == "&File"
+    assert menu.menuAction().text() == "&Files"
+    assert menu.actions()[0].text() == "&Open"
+    assert not app.filters
+    assert not guard._tracked
+
+
+def test_repeated_scans_do_not_lose_original():
+    _, guard_module = modules()
+    window = QWidget()
+    bar = QMenuBar(window)
+    menu = QMenu("&Edit", bar)
+    bar.add(menu.menuAction())
+    app = QApplication([window])
+    guard = guard_module.GlobalMnemonicGuard({}, app)
+    guard.set_enabled(True)
+    guard.scan_existing_windows()
+    guard.scan_existing_windows()
+    guard.set_enabled(False)
+    assert menu.title() == "&Edit"
+    assert menu.menuAction().text() == "&Edit"
+
+
+def test_dynamic_label_and_rich_text():
+    _, guard_module = modules()
+    window = QWidget()
+    plain = QLabel("&Select", window)
+    rich = QLabel("<a href='https://example.org?a=1&amp;b=2'>&Link</a>", window)
+    app = QApplication([window])
